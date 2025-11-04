@@ -1,0 +1,557 @@
+'''
+Это класс для отбора ценных кадров из видео на основании Vision-модели Gemini. 
+
+Данные на вход:
+1. Ключ API VSE GPT
+2. Файл в формате .srt c транскрибацией видео с помощью Whisper
+3. Файл видео 
+
+Результат:
+В папке "Gemini_frames" - отобранные кадры.
+'''
+
+from openai import OpenAI
+import re
+from tqdm import tqdm
+import cv2
+import os
+import logging
+import base64
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image
+from PIL import Image as PILImage
+
+
+class Gemini_Flash_Slide_Detection:
+    def __init__(self):
+        self.api_key = None       
+        self.client = OpenAI(api_key=0, base_url="https://api.vsegpt.ru/v1")
+        self.model_name = "vis-google/gemini-2.5-flash-pre-05-20"
+        self.temperature = 0
+        self.max_tokens = 10
+        self.end_seconds = 2
+        self.output_dir ='Gemini_frames'
+        self.srt_path = None
+        self.video_path = None
+
+    @staticmethod
+    def _parse_time(time_str):
+        time_str = time_str.replace(',', '.')
+        hours, minutes, seconds = map(float, time_str.split(':'))
+        return round(hours * 3600 + minutes * 60 + seconds, 4)
+    
+    @staticmethod
+    def _seconds_to_frame_path(self, seconds, output_dir):
+        #Преобразует секунды в путь к кадру с исправленным форматированием
+        minutes = int(seconds // 60)
+        seconds_remainder = seconds % 60
+        seconds_int = int(seconds_remainder)
+        milliseconds = int((seconds_remainder - seconds_int) * 1000)
+        
+        frame_name = f"frame_{minutes:02d}m_{seconds_int:02d}s_{milliseconds:03d}ms.png"
+        return os.path.join(output_dir, frame_name)
+    
+    @staticmethod
+    def _path_to_seconds(frame_path):
+        
+        filename = frame_path.split('\\')[-1]  # Получаем имя файла из пути
+        time_parts = filename.split('_')[1:]  # Получаем ['00m', '00s.png']
+        
+        minutes = int(time_parts[0][:-1])
+        seconds = int(time_parts[1][:-1])  # Убираем 'm' и преобразуем в int
+        milliseconds = int(time_parts[2][:-6])  # Убираем 's.png' и преобразуем в int
+        
+        return minutes * 60 + seconds + milliseconds*0.001
+
+    @staticmethod
+    def _ensure_dir(directory):
+        #Создаёт папку, если она не существует.
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+
+    @staticmethod
+    def _image_to_base64(file_path):
+        with open(file_path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+        return f"data:image/png;base64,{encoded_string}"
+    
+    @staticmethod
+    def _find_text_in_entries(second, entries):
+        for i in entries:
+            if int(second) ==  int(i[1]):
+                return i[2]
+
+    def _clear_output_dir(self):
+        #Очищает папку от файлов (без рекурсивного удаления поддиректорий)
+        if os.path.exists(self.output_dir):
+            for filename in os.listdir(self.output_dir):
+                file_path = os.path.join(self.output_dir, filename)
+                if os.path.isfile(file_path):
+                    try:
+                        os.unlink(file_path)
+                    except Exception as e:
+                        print(f'Ошибка удаления {file_path}: {e}')
+    
+    def parse_srt(self):
+        
+        try:
+            if self.srt_path == None:
+                self.srt_path = input("Введите путь к SRT-файлу: ").strip().strip('"')
+            self.srt_path = self.srt_path.strip().strip('"')
+            with open(self.srt_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            print(f"Ошибка чтения SRT-файла {self.srt_path}: {e}")
+            return []
+
+        entries = []
+        blocks = content.strip().split('\n\n')
+        
+        for block in blocks:
+            lines = block.split('\n')
+            if len(lines) >= 3:
+                timing_match = re.match(r'(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})', lines[1])
+                if timing_match:
+                    start_str, end_str = timing_match.groups()
+                    start_sec = self._parse_time(str(start_str))
+                    end_sec = self._parse_time(end_str)
+                    text = ' '.join(lines[2:])
+                    entries.append((start_sec, end_sec, text))
+        
+        return entries
+    
+    def get_end_sentence_frame_times(self, entries):
+        return [entry[1]-self.end_seconds for entry in entries]
+    
+    def extract_frames(self, frame_times: list[float], progress_bar: bool = True) -> list[str]:
+        """
+        Извлекает кадры из видео по заданным временным меткам.
+        
+        Args:
+            frame_times: Список временных меток в секундах для извлечения кадров
+            progress_bar: Показывать ли прогресс-бар (по умолчанию True)
+            
+        Returns:
+            Список путей к сохраненным кадрам
+            
+        Raises:
+            ValueError: Если видеофайл не может быть открыт
+        """
+        self._ensure_dir(self.output_dir)
+
+        if self.video_path is None:
+            self.video_path = input("Введите путь к видеофайлу: ").strip().strip('"')
+        
+        self.video_path = self.video_path.strip().strip('"')
+
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Не удалось открыть видеофайл: {self.video_path}")
+        
+        saved_frames = []
+        
+        # Выбираем итератор в зависимости от наличия прогресс-бара
+        iterator = tqdm(frame_times, unit="кадр", desc="Извлечение кадров") if progress_bar else frame_times
+        
+        for target_time in iterator:
+            cap.set(cv2.CAP_PROP_POS_MSEC, target_time * 1000)
+            ret, frame = cap.read()
+            
+            if not ret:
+                print(f"Не удалось извлечь кадр на {target_time:.2f} секунде")
+                continue
+            
+            minutes = int(target_time // 60)
+            seconds = int(target_time % 60)
+            milliseconds = int((target_time - int(target_time)) * 1000)
+            
+            filename = f"frame_{minutes:02d}m_{seconds:02d}s_{milliseconds:03d}ms.png"
+            output_path = os.path.join(self.output_dir, filename)
+            
+            cv2.imwrite(output_path, frame)
+            saved_frames.append(output_path)
+        
+        cap.release()
+        return saved_frames
+    
+
+    def detect_theme_change(self, list_of_frames: list) -> list:
+        """Определяет смену темы. 
+
+        Сравнивает попарно все кадры, которые были извлечены на предыдущем этапе. 
+        Если кадры похожи, то считает, что слайд еще формируется.
+        Если видно, что слайд различаются - значит, тема повествования поменялась,
+        и берет первый кадр из пары как финальный кадр темы.
+        
+        Args:
+            list_of_frames: список путей к кадрам, которые были извлечены с помощью extract_frames() 
+            
+        Returns:
+            Список путей к кадрам, которые считаются финальными в своих темах
+            
+        Иногда из-за проблем с ответом или подключением будут ошибки:
+        есть три попытки попробовать еще раз, потом алгоритм идет дальше.
+        """
+        if self.api_key == None:
+            self.api_key = input("Введите ключ API: ").strip().strip('"')
+            self.client = OpenAI(api_key=self.api_key, base_url="https://api.vsegpt.ru/v1")
+        
+        theme_frames = []
+        last_command = 0
+        total_pairs = len(list_of_frames) - 1
+        max_retries = 3
+
+        with tqdm(total=total_pairs, desc="Анализ смены тем", unit="pair") as pbar:
+            for index in range(total_pairs):
+                retry_count = 0
+                success = False
+                
+                while retry_count < max_retries and not success:
+                    try:
+                        prompt = """Analyze and compare these two consecutive video frames.
+
+                        Evaluation criteria:
+                        1. --1--:
+                        - The second frame contains most visual elements from the first frame
+                        - Additional information/text/visuals are added
+                        - Typical cases: bullet points appearing one by one, diagrams building up
+
+
+                        2. --2--:
+                        - The second frame shows different information/layout
+                        - Visual style/layout changes
+                        - Typical cases: slide transitions, scene changes, new topics
+                    
+
+                        In doing this pay more attention to the information (text, graphs, numbers, visuals)
+                        Elements like speaker or background do not change in most cases anyway.
+                        
+                        Your response should ONLY contain one of these options:
+                        --1-- (for progressive similarity)
+                        --2-- (for different content) 
+                        
+                        You are allowed to choose more --2-- if it has slight chance to be correct.
+                        Choose --1-- only if it is obvious to be correct. 
+
+                        """
+
+                        frame1 = self._image_to_base64(list_of_frames[index])
+                        frame2 = self._image_to_base64(list_of_frames[index+1])
+
+                        messages = [
+                            {"role": "user", "content": [
+                                {"type": "text", "text": "Image 1"},
+                                {"type": "image_url", "image_url": frame1}
+                            ]},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": "Image 2"},
+                                {"type": "image_url", "image_url": frame2}
+                            ]},
+                            {"role": "user", "content": prompt}
+                        ]
+
+                        response = self.client.chat.completions.create(
+                            model=self.model_name,
+                            messages=messages,
+                            temperature=self.temperature,
+                            max_tokens=self.max_tokens,
+                        ).choices[0].message.content
+
+                        command_match = re.search(r'--(\d+)--', response)
+                        if not command_match:
+                            retry_count += 1
+                            continue
+
+                        command = int(command_match.group(1))
+                        
+                        if command == 1:
+                            if last_command in (1, 2) and theme_frames:
+                                theme_frames[-1] = list_of_frames[index+1]
+                            else:
+                                theme_frames.append(list_of_frames[index+1])
+                        elif command == 2:
+                            theme_frames.append(list_of_frames[index+1])
+
+                        last_command = command
+                        success = True
+                        pbar.update(1)  # Обновляем прогресс-бар только при успехе
+
+                    except Exception as e:
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            pbar.update(1)  # Все равно обновляем прогресс при окончании попыток
+                            break
+
+        return theme_frames
+    
+    def is_speaker_only(self, entries: tuple, theme_frames: list) -> list:
+        """Удаляет кадры, которые не несут информации. 
+
+        Поскольку на шаге детекции сцен нас интересует просто смена темы, 
+        в список кадров попадают просто кадры со спикером, не несущие смысловой нагрузки. 
+        Код отправляет картинку и текст, который произносился спикером во время ее показа. 
+        Если картинка не информативно или текст не подходит к картинке, она удаляется.
+        
+        Args:
+            theme_frames: список путей к кадрам, которые были отобраны с помощью detect_theme_change() 
+            entries: кортеж, полученный с помощью _parse_srt(). 
+                Первый элемент кортежа - секунда начала речи.
+                Второй элемент кортежа - секунда окончания речи.
+                Третий элемент кортежа - сам текст речи.
+        Returns:
+            Список путей к кадрам, которые считаются информативными
+            
+        Иногда из-за проблем с ответом или подключением будут ошибки:
+        есть три попытки попробовать еще раз, потом алгоритм идет дальше.
+        """
+        clear_frames = []
+        max_retries = 3
+        
+        with tqdm(total=len(theme_frames), desc="Фильтрация кадров", unit="кадр") as pbar:
+            for current_frame_path in theme_frames:
+                if not os.path.exists(current_frame_path):
+                    pbar.update(1)
+                    continue
+
+                retry_count = 0
+                success = False
+                
+                while retry_count < max_retries and not success:
+                    try:
+                        frame_time = self._path_to_seconds(current_frame_path)
+                        text_before_frame = self._find_text_in_entries(frame_time, entries)
+
+                        prompt = f'''STRICT INSTRUCTIONS: Analyze the video frame and respond ONLY with --1-- or --2-- based on these rules:
+
+                        ### Input Data:
+                        - Transcript excerpt: "{text_before_frame}"
+
+                        ### Frame Analysis Rules:
+                        1. Return --1-- if:
+                        - Only the speaker's face is visible (no additional information and visuals)
+                        - Transitional/blurry frame
+                        - Partially shown text
+
+                        2. Return --2-- if:
+                        - Contains useful visuals/text
+                        - Shows slides/diagrams
+                        - Has readable content
+
+                        Response MUST be: --1-- or --2--'''
+
+                        frame = self._image_to_base64(current_frame_path)
+                        
+                        messages = [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "Current Frame"},
+                                    {"type": "image_url", "image_url": frame},
+                                ],
+                            },
+                            {"role": "user", "content": prompt.format(text_before_frame=text_before_frame)}
+                        ]
+
+                        response = self.client.chat.completions.create(
+                            model=self.model_name,
+                            messages=messages,
+                            temperature=self.temperature,
+                            max_tokens=self.max_tokens,
+                        ).choices[0].message.content
+
+                        # Улучшенная обработка ответа
+                        clean_response = response.strip().replace('-', '')
+                        if clean_response in ('1', '2'):
+                            command = int(clean_response)
+                        else:
+                            # Пробуем найти цифру в любом формате
+                            digit_match = re.search(r'\b([12])\b', response)
+                            command = int(digit_match.group(1)) if digit_match else None
+
+                        if command == 2:
+                            clear_frames.append(current_frame_path)
+                        success = True
+
+                    except Exception as e:
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            break
+
+                pbar.update(1)
+                
+        return clear_frames
+
+    def select_best_frame(self, clear_frames: list) -> list:
+        """Выбирает лучший кадр из окружения. 
+
+        Иногда из-за анимации или просто случайно кадр, который мы выбрали на предыдущем шаге, плохой.
+        (Обрезанный текст, следы анимации и так далее)
+        Мы передаем в Vision-модель три кадра: оригинальный и два соседних.
+        Модель ищет тот, который, по ее мнению, окажется удачнее. 
+
+        Важно: эмпирически замечено, что дешевые модели плохо сравнивают больше 3-х, 4-х картинок за раз. 
+        
+        Args:
+            clear_frames: список путей к кадрам, которые были отобраны с помощью clear_frames() 
+
+        Returns:
+            Список путей к кадрам, которые считаются информативными
+            
+        Иногда из-за проблем с ответом или подключением будут ошибки:
+        есть три попытки попробовать еще раз, потом алгоритм идет дальше.
+        """
+        best_frames = []
+        max_retries = 3
+        
+        with tqdm(total=len(clear_frames), desc="Выбор лучших кадров", unit="кадр") as pbar:
+            for current_frame_path in clear_frames:
+                retry_count = 0
+                success = False
+                
+                while retry_count < max_retries and not success:
+                    try:
+                        current_time = self._path_to_seconds(current_frame_path)
+                        prev_time = current_time - 1
+                        next_time = current_time + 1
+
+                        # Извлекаем соседние кадры (без прогресс-бара)
+                        prev_frame_path, next_frame_path = self.extract_frames([prev_time, next_time], progress_bar=False)
+
+                        # Если какие-то кадры отсутствуют, используем текущий
+                        if not all(os.path.exists(p) for p in [prev_frame_path, current_frame_path, next_frame_path]):
+                            best_frames.append(current_frame_path)
+                            success = True
+                            continue
+
+                        # Формируем промпт и сообщения
+                        prompt = '''STRICT INSTRUCTIONS: Choose the best frame (ONLY respond with number):
+                        1 - Previous frame (-1s)
+                        2 - Current frame
+                        3 - Next frame (+1s)'''
+
+                        messages = [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "Previous Frame (-1s)"},
+                                    {"type": "image_url", "image_url": self._image_to_base64(prev_frame_path)},
+                                ]
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "Current Frame"},
+                                    {"type": "image_url", "image_url": self._image_to_base64(current_frame_path)},
+                                ]
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "Next Frame (+1s)"},
+                                    {"type": "image_url", "image_url": self._image_to_base64(next_frame_path)},
+                                ]
+                            },
+                            {"role": "user", "content": prompt}
+                        ]
+
+                        # Отправляем запрос
+                        response = self.client.chat.completions.create(
+                            model=self.model_name,
+                            messages=messages,
+                            temperature=self.temperature,
+                            max_tokens=self.max_tokens,
+                        ).choices[0].message.content
+
+                        # Универсальная обработка ответа (1/2/3 или --1--/--2--/--3--)
+                        command = int(re.search(r'(\d)', response.strip().replace('-', '')).group(1))
+                        selected_frame = [prev_frame_path, current_frame_path, next_frame_path][command-1]
+                        best_frames.append(selected_frame)
+                        success = True
+
+                    except Exception as e:
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            best_frames.append(current_frame_path)  # Резервный вариант
+                            break
+
+                pbar.update(1)  # Обновляем прогресс после обработки каждого кадра
+                
+        return best_frames
+    
+    def delete_extra_frames(self, list_of_chosen_frames: list):
+        '''
+        Удаляет из self.output_dir все кадры, которых нет в выбранных с помощью select_best_frame().
+        '''
+        list_of_all_frames = os.listdir(self.output_dir)
+        for frame in list_of_all_frames:
+            frame_path = os.path.join(self.output_dir,frame)
+            if frame_path not in list_of_chosen_frames:  
+                try:
+                    os.remove(frame_path)
+                except OSError as e:
+                    print(f"Error deleting {frame_path}: {e}")
+
+    def prepare_excel(self, list_of_chosen_frames: list, name = 'valuable_frames'):
+        
+        # Создаем новый Excel-файл
+        wb = Workbook()
+        ws = wb.active
+
+        # Настройка ширины столбца и высоты строк (подгонка под изображения)
+        ws.column_dimensions['A'].width = 40  # Ширина столбца A в символах
+
+        # Вставляем изображения в столбец A
+        for i, img_path in enumerate(list_of_chosen_frames, start=1):
+            if not os.path.exists(img_path):
+                print(f"Файл не найден: {img_path}")
+                continue
+
+            # Открываем изображение с помощью PIL (проверка формата)
+            try:
+                pil_img = PILImage.open(img_path)
+                pil_img.verify()  # Проверка целостности файла
+            except (IOError, SyntaxError) as e:
+                print(f"Ошибка загрузки изображения {img_path}: {e}")
+                continue
+
+            # Создаем объект Image для openpyxl
+            img = Image(img_path)
+
+            # Масштабирование (опционально)
+            img.width = 250  # Ширина в пикселях
+            img.height = 150  # Высота в пикселях
+
+            # Вставляем изображение в ячейку A{i}
+            ws.add_image(img, f'A{i}')
+
+            # Устанавливаем высоту строки (опционально)
+            ws.row_dimensions[i].height = 120  # Высота строки в пунктах
+
+        # Сохраняем Excel-файл
+        output_excel_path = f"{name}.xlsx"
+        wb.save(output_excel_path)
+        print(f"Файл сохранен: {output_excel_path}")
+    
+    def extract_valuable_frames(self):
+        logging.getLogger("openai").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
+        self._clear_output_dir()
+        parsed_subs = self.parse_srt()
+        frames_time_list = self.get_end_sentence_frame_times(parsed_subs)
+        saved_frames_list = self.extract_frames(frames_time_list)
+        theme_frames = self.detect_theme_change(saved_frames_list)
+        clear_frames = self.is_speaker_only(theme_frames=theme_frames, entries=parsed_subs)
+        final_frames = self.select_best_frame(clear_frames=clear_frames)
+        self.delete_extra_frames(final_frames)
+        return final_frames
+
+if __name__ == "__main__":
+    # Инициализация детектора
+   
+    detector = Gemini_Flash_Slide_Detection()
+    
+    valuable_frames = detector.extract_valuable_frames()
+        
+        # Создание Excel-файла с результатами
+    detector.prepare_excel(valuable_frames,'3')
